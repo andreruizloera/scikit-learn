@@ -1,0 +1,9 @@
+- :meth:`neighbors.KernelDensity.score_samples` no longer returns different
+  log-densities depending on ``leaf_size``. The kernel density traversal in
+  :class:`neighbors.KDTree` and :class:`neighbors.BallTree` maintained a
+  running global bracket width by repeated log-space subtraction, which
+  cancels catastrophically and made both the pruning decision and the returned
+  value depend on the shape of the tree. Nodes are now pruned against the
+  running lower bound on the total density, and the accumulated lower bound is
+  returned directly.
+  By :user:`Andre Ruiz Loera <andreruizloera>`.

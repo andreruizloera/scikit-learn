@@ -1587,10 +1587,8 @@ cdef class BinaryTree{{name_suffix}}:
                                             log_knorm, log_atol, log_rtol,
                                             log_min_bound,
                                             log_bound_spread,
-                                            &log_min_bound,
-                                            &log_bound_spread)
-                log_density[i] = logaddexp(log_min_bound,
-                                           log_bound_spread - log(2))
+                                            &log_min_bound)
+                log_density[i] = log_min_bound
                 pt += n_features
 
         # normalize the results
@@ -2068,14 +2066,16 @@ cdef class BinaryTree{{name_suffix}}:
         # For the given point, node_log_min_bounds and node_log_bound_spreads
         # will encode the current bounds on the density between the point
         # and the associated node.
-        # The variables global_log_min_bound and global_log_bound_spread
-        # keep track of the global bounds on density.  The procedure here is
-        # to split nodes, updating these bounds, until the bounds are within
-        # atol & rtol.
+        # The variable global_log_min_bound accumulates a lower bound on the
+        # density over the entire tree: the exact contribution of every point
+        # that has been visited, plus the minimum bound of every node that has
+        # been pruned.  A node is pruned as soon as the width of its own
+        # bracket is negligible with respect to that running lower bound;
+        # otherwise it is split, so the returned value only depends on which
+        # nodes could be pruned and not on the shape of the tree.
         cdef intp_t i, i1, i2, i_node
         cdef float64_t N1, N2
-        cdef float64_t global_log_min_bound, global_log_bound_spread
-        cdef float64_t global_log_max_bound
+        cdef float64_t global_log_min_bound
 
         cdef const {{INPUT_DTYPE_t}}* data = &self.data[0, 0]
         cdef bint with_sample_weight = self.sample_weight is not None
@@ -2108,13 +2108,12 @@ cdef class BinaryTree{{name_suffix}}:
         global_log_min_bound = log(N) + compute_log_kernel(
             max_dist{{name_suffix}}(self, 0, pt), h, kernel
         )
-        global_log_max_bound = log(N) + compute_log_kernel(nodeheap_item.val,
-                                                           h, kernel)
-        global_log_bound_spread = logsubexp(global_log_max_bound,
-                                            global_log_min_bound)
 
         node_log_min_bounds[0] = global_log_min_bound
-        node_log_bound_spreads[0] = global_log_bound_spread
+        node_log_bound_spreads[0] = logsubexp(
+            log(N) + compute_log_kernel(nodeheap_item.val, h, kernel),
+            global_log_min_bound,
+        )
 
         while nodeheap.n > 0:
             nodeheap_item = nodeheap.pop()
@@ -2128,28 +2127,23 @@ cdef class BinaryTree{{name_suffix}}:
                 N1 = node_info.idx_end - node_info.idx_start
 
             # ------------------------------------------------------------
-            # Case 1: local bounds are equal to within per-point tolerance.
+            # Case 1: the bounds of this node are equal to within errors.
+            # The tolerance is taken relative to the running lower bound on
+            # the total density rather than to the lower bound of this node
+            # alone: the latter is a sum of exactly accumulated terms, while
+            # the former can be many orders of magnitude smaller than the
+            # density it bounds.
             if (log_knorm + node_log_bound_spreads[i_node] - log(N1) + log(N)
                 <= logaddexp(log_atol, (log_rtol + log_knorm
-                                        + node_log_min_bounds[i_node]))):
+                                        + global_log_min_bound))):
                 pass
 
             # ------------------------------------------------------------
-            # Case 2: global bounds are within rtol & atol.
-            elif (log_knorm + global_log_bound_spread
-                  <= logaddexp(log_atol,
-                               log_rtol + log_knorm + global_log_min_bound)):
-                break
-
-            # ------------------------------------------------------------
-            # Case 3: node is a leaf. Count contributions from all points
+            # Case 2: node is a leaf. Count contributions from all points
             elif node_info.is_leaf:
                 global_log_min_bound =\
                     logsubexp(global_log_min_bound,
                               node_log_min_bounds[i_node])
-                global_log_bound_spread =\
-                    logsubexp(global_log_bound_spread,
-                              node_log_bound_spreads[i_node])
                 for i in range(node_info.idx_start, node_info.idx_end):
                     dist_pt = self.dist(pt, data + n_features * idx_array[i],
                                         n_features)
@@ -2162,7 +2156,7 @@ cdef class BinaryTree{{name_suffix}}:
                                                      log_density + log_weight)
 
             # ------------------------------------------------------------
-            # Case 4: split node and query subnodes
+            # Case 3: split node and query subnodes
             else:
                 i1 = 2 * i_node + 1
                 i2 = 2 * i_node + 2
@@ -2182,16 +2176,18 @@ cdef class BinaryTree{{name_suffix}}:
                 node_log_min_bounds[i1] = (log(N1) +
                                            compute_log_kernel(dist_UB_1,
                                                               h, kernel))
-                node_log_bound_spreads[i1] = (log(N1) +
-                                              compute_log_kernel(dist_LB_1,
-                                                                 h, kernel))
+                node_log_bound_spreads[i1] = logsubexp(
+                    log(N1) + compute_log_kernel(dist_LB_1, h, kernel),
+                    node_log_min_bounds[i1],
+                )
 
                 node_log_min_bounds[i2] = (log(N2) +
                                            compute_log_kernel(dist_UB_2,
                                                               h, kernel))
-                node_log_bound_spreads[i2] = (log(N2) +
-                                              compute_log_kernel(dist_LB_2,
-                                                                 h, kernel))
+                node_log_bound_spreads[i2] = logsubexp(
+                    log(N2) + compute_log_kernel(dist_LB_2, h, kernel),
+                    node_log_min_bounds[i2],
+                )
 
                 global_log_min_bound = logsubexp(global_log_min_bound,
                                                  node_log_min_bounds[i_node])
@@ -2199,14 +2195,6 @@ cdef class BinaryTree{{name_suffix}}:
                                                  node_log_min_bounds[i1])
                 global_log_min_bound = logaddexp(global_log_min_bound,
                                                  node_log_min_bounds[i2])
-
-                global_log_bound_spread =\
-                    logsubexp(global_log_bound_spread,
-                              node_log_bound_spreads[i_node])
-                global_log_bound_spread = logaddexp(global_log_bound_spread,
-                                                    node_log_bound_spreads[i1])
-                global_log_bound_spread = logaddexp(global_log_bound_spread,
-                                                    node_log_bound_spreads[i2])
 
                 # TODO: rank by the spread rather than the distance?
                 nodeheap_item.val = dist_LB_1
@@ -2218,8 +2206,7 @@ cdef class BinaryTree{{name_suffix}}:
                 nodeheap.push(nodeheap_item)
 
         nodeheap.clear()
-        return logaddexp(global_log_min_bound,
-                         global_log_bound_spread - log(2))
+        return global_log_min_bound
 
     cdef int _kde_single_depthfirst(
         self,
@@ -2233,14 +2220,18 @@ cdef class BinaryTree{{name_suffix}}:
         float64_t local_log_min_bound,
         float64_t local_log_bound_spread,
         float64_t* global_log_min_bound,
-        float64_t* global_log_bound_spread,
     ) except -1:
         """recursive single-tree kernel density estimate, depth-first"""
-        # For the given point, local_min_bound and local_max_bound give the
-        # minimum and maximum density for the current node, while
-        # global_min_bound and global_max_bound give the minimum and maximum
-        # density over the entire tree.  We recurse down until global_min_bound
-        # and global_max_bound are within rtol and atol.
+        # For the given point, local_log_min_bound and local_log_bound_spread
+        # give the minimum density for the current node and the width of the
+        # interval that brackets it, while global_log_min_bound accumulates a
+        # lower bound on the density over the entire tree: the exact
+        # contribution of every point that has been visited, plus the minimum
+        # bound of every node that has been pruned.  A node is pruned as soon
+        # as the width of its own bracket is negligible with respect to that
+        # running lower bound; otherwise we recurse until we reach its leaves,
+        # so the returned value only depends on which nodes could be pruned
+        # and not on the order in which the tree happens to be traversed.
         cdef intp_t i, i1, i2, iw, start, end
         cdef float64_t N1, N2
 
@@ -2270,28 +2261,23 @@ cdef class BinaryTree{{name_suffix}}:
             N2 = <float64_t>self.data.shape[0]
 
         # ------------------------------------------------------------
-        # Case 1: local bounds are equal to within errors.  Return
+        # Case 1: the bounds of this node are equal to within errors.  Return.
+        # The tolerance is taken relative to the running lower bound on the
+        # total density rather than to the lower bound of this node alone:
+        # the latter is a sum of exactly accumulated terms, while the former
+        # can be many orders of magnitude smaller than the density it bounds.
         if (
             log_knorm + local_log_bound_spread - log(N1) + log(N2)
-            <= logaddexp(log_atol, (log_rtol + log_knorm + local_log_min_bound))
+            <= logaddexp(log_atol,
+                         (log_rtol + log_knorm + global_log_min_bound[0]))
         ):
             pass
 
         # ------------------------------------------------------------
-        # Case 2: global bounds are within rtol & atol. Return
-        elif (
-            log_knorm + global_log_bound_spread[0]
-            <= logaddexp(log_atol, (log_rtol + log_knorm + global_log_min_bound[0]))
-        ):
-            pass
-
-        # ------------------------------------------------------------
-        # Case 3: node is a leaf. Count contributions from all points
+        # Case 2: node is a leaf. Count contributions from all points
         elif node_info.is_leaf:
             global_log_min_bound[0] = logsubexp(global_log_min_bound[0],
                                                 local_log_min_bound)
-            global_log_bound_spread[0] = logsubexp(global_log_bound_spread[0],
-                                                   local_log_bound_spread)
             for i in range(node_info.idx_start, node_info.idx_end):
                 dist_pt = self.dist(pt, (data + n_features * idx_array[i]),
                                     n_features)
@@ -2305,7 +2291,7 @@ cdef class BinaryTree{{name_suffix}}:
                                                      log_weight))
 
         # ------------------------------------------------------------
-        # Case 4: split node and query subnodes
+        # Case 3: split node and query subnodes
         else:
             i1 = 2 * i_node + 1
             i2 = 2 * i_node + 2
@@ -2342,25 +2328,16 @@ cdef class BinaryTree{{name_suffix}}:
             global_log_min_bound[0] = logaddexp(global_log_min_bound[0],
                                                 child2_log_min_bound)
 
-            global_log_bound_spread[0] = logsubexp(global_log_bound_spread[0],
-                                                   local_log_bound_spread)
-            global_log_bound_spread[0] = logaddexp(global_log_bound_spread[0],
-                                                   child1_log_bound_spread)
-            global_log_bound_spread[0] = logaddexp(global_log_bound_spread[0],
-                                                   child2_log_bound_spread)
-
             self._kde_single_depthfirst(i1, pt, kernel, h, log_knorm,
                                         log_atol, log_rtol,
                                         child1_log_min_bound,
                                         child1_log_bound_spread,
-                                        global_log_min_bound,
-                                        global_log_bound_spread)
+                                        global_log_min_bound)
             self._kde_single_depthfirst(i2, pt, kernel, h, log_knorm,
                                         log_atol, log_rtol,
                                         child2_log_min_bound,
                                         child2_log_bound_spread,
-                                        global_log_min_bound,
-                                        global_log_bound_spread)
+                                        global_log_min_bound)
         return 0
 
     cdef int _two_point_single(

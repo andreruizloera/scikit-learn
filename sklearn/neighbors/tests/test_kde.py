@@ -1,6 +1,7 @@
 import joblib
 import numpy as np
 import pytest
+from scipy.special import logsumexp
 
 from sklearn.datasets import make_blobs
 from sklearn.exceptions import NotFittedError
@@ -250,3 +251,34 @@ def test_bandwidth(bandwidth):
     else:
         h = bandwidth
     assert kde.bandwidth_ == pytest.approx(h)
+
+
+@pytest.mark.parametrize("breadth_first", [True, False])
+def test_kde_score_samples_independent_of_leaf_size(breadth_first):
+    """`leaf_size` only shapes the tree, it must not change the density.
+
+    Non-regression test for gh-7492: with the default `atol=0, rtol=0` the
+    traversal is exact, so every `leaf_size` has to agree with a brute-force
+    reference accumulated with `logsumexp`.
+    """
+    # A small bandwidth in many dimensions makes the per-node bounds span
+    # thousands of nats, which is what used to make the traversal order
+    # visible in the result.
+    n_samples, n_features, bandwidth = 100, 64, 0.175
+    rng = np.random.RandomState(0)
+    X = rng.randn(n_samples, n_features)
+    Y = rng.randn(5, n_features)
+
+    sq_dist = ((Y[:, None, :] - X) ** 2).sum(-1)
+    log_dens_true = (
+        logsumexp(-0.5 * sq_dist / bandwidth**2, axis=1)
+        - np.log(n_samples)
+        - 0.5 * n_features * np.log(2 * np.pi * bandwidth**2)
+    )
+
+    for leaf_size in (2, 5, 20, n_samples):
+        kde = KernelDensity(
+            bandwidth=bandwidth, leaf_size=leaf_size, breadth_first=breadth_first
+        ).fit(X)
+        log_dens = kde.score_samples(Y)
+        assert_allclose(log_dens, log_dens_true, rtol=1e-10)
